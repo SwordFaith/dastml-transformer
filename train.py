@@ -4,6 +4,7 @@ from typing import Optional, List
 import torch
 import numpy as np
 from torch import nn, optim
+import torch.nn.functional as F
 
 # from tensorboardX import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
@@ -168,15 +169,6 @@ def domain_d_step(
     batch_size = inp_tokens.size(0)
 
     with torch.no_grad():
-        raw_gen_log_probs = model_F(
-            inp_tokens,
-            None,
-            inp_lengths,
-            raw_styles,
-            generate=True,
-            differentiable_decode=True,
-            temperature=temperature,
-        )
         rev_gen_log_probs = model_F(
             inp_tokens,
             None,
@@ -187,20 +179,29 @@ def domain_d_step(
             temperature=temperature,
         )
 
-    raw_gen_soft_tokens = raw_gen_log_probs.exp()
-    raw_gen_lengths = get_lengths(raw_gen_soft_tokens.argmax(-1), eos_idx)
-
     rev_gen_soft_tokens = rev_gen_log_probs.exp()
     rev_gen_lengths = get_lengths(rev_gen_soft_tokens.argmax(-1), eos_idx)
 
-    raw_gold_log_probs = model_domain_D(inp_tokens, inp_lengths)
-    raw_gen_log_probs = model_domain_D(raw_gen_soft_tokens, raw_gen_lengths)
-    rev_gen_log_probs = model_domain_D(rev_gen_soft_tokens, rev_gen_lengths)
-    gen_log_probs = torch.cat((raw_gen_log_probs, rev_gen_log_probs), 0)
-    domain_cns_log_probs = torch.cat((raw_gold_log_probs, gen_log_probs), 0)
-    domain_cns_labels = torch.cat((domains, domains, domains), 0)
+    with torch.no_grad():
+        rec_gen_log_probs = model_F(
+            rev_gen_soft_tokens,
+            None,
+            rev_gen_lengths,
+            raw_styles,
+            generate=True,
+            differentiable_decode=True,
+            temperature=temperature,
+        )
 
-    domain_cns_loss = loss_fn(domain_cns_log_probs, domain_cns_labels)
+    rec_gen_soft_tokens = rec_gen_log_probs.exp()
+    rec_gen_lengths = get_lengths(rec_gen_soft_tokens.argmax(-1), eos_idx)
+
+    raw_gold_log_probs = model_domain_D(inp_tokens, inp_lengths)
+    rec_gen_log_probs = model_domain_D(rec_gen_soft_tokens, rec_gen_lengths)
+    rev_gen_log_probs = model_domain_D(rev_gen_soft_tokens, rev_gen_lengths)
+
+    domain_cns_loss = loss_fn(raw_gold_log_probs, domains)
+    domain_cns_loss += nn.KLDivLoss(reduction="batchmean", log_target=True)(rec_gen_log_probs, rev_gen_log_probs)
     assert len(domain_cns_loss.size()) == 1
     domain_cns_loss = domain_cns_loss.sum() / batch_size
     loss = domain_cns_loss
